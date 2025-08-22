@@ -354,7 +354,9 @@ def main():
 
                 if avg_volume > 0:
                     # Drop low volume days for the symbol
-                    drop_lowvolume_days(symbol, actual_start_date, end_date, avg_volume, cursor)
+                    # DISABLING as it is causing high CPU load on QuestDB server
+                    #drop_lowvolume_days(symbol, actual_start_date, end_date, avg_volume, cursor)
+                    continue
 
                 # Commit changes for this symbol
                 conn.commit()
