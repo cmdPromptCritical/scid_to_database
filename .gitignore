@@ -2,5 +2,5 @@ checkpoint.json
 .env
 questdb.env
 candlestick_charts/
-checkpoint_qdb.json
-checkpoint_qdb.json
+*.json
+lib/charts/*

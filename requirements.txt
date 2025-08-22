@@ -4,3 +4,5 @@ python-dotenv
 questdb
 psycopg2-binary
 pandas
+matplotlib
+mplfinance
