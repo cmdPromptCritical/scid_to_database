@@ -150,17 +150,117 @@ def deduplicate_data(cursor, symbol, date_str):
         cursor.connection.rollback()
 
 
+def compute_average_daily_volume(symbol, cursor):
+    """
+    Computes the average daily volume for the latest 30 days where front_contract = true
+    for the given symbol.
+    """
+    try:
+        # Get the latest 30 distinct dates with data for this symbol
+        cursor.execute("""
+            SELECT DISTINCT to_str(time, 'yyyy-MM-dd') as date
+            FROM trades
+            WHERE symbol = %s AND front_contract = true
+            ORDER BY date DESC
+            LIMIT 30;
+        """, (symbol,))
+
+        recent_dates = cursor.fetchall()
+
+        if not recent_dates:
+            print(f"  - No recent data found for symbol '{symbol}'. Skipping average volume computation.")
+            return 0
+
+        # For each of these dates, sum the volume where front_contract = true
+        daily_volumes = []
+        for (date_str,) in recent_dates:
+            cursor.execute("""
+                SELECT sum(volume) as daily_volume
+                FROM trades
+                WHERE symbol = %s AND to_str(time, 'yyyy-MM-dd') = %s AND front_contract = true;
+            """, (symbol, date_str))
+
+            result = cursor.fetchone()
+            if result and result[0]:
+                daily_volumes.append(result[0])
+
+        if not daily_volumes:
+            print(f"  - No volume data found for symbol '{symbol}' in recent dates. Skipping average volume computation.")
+            return 0
+
+        avg_volume = sum(daily_volumes) / len(daily_volumes)
+        print(f"  - Computed average daily volume for '{symbol}': {avg_volume:.2f} (based on {len(daily_volumes)} days)")
+        return avg_volume
+
+    except psycopg2.Error as e:
+        print(f"  - Error computing average daily volume for symbol '{symbol}': {e}", file=sys.stderr)
+        return 0
+
+
+def drop_lowvolume_days(symbol, start_date, end_date, avg_volume, cursor):
+    """
+    Identifies and removes low volume days (holidays) for a symbol by setting front_contract = false
+    for days where the volume is below 20% of the average daily volume.
+    """
+    if avg_volume <= 0:
+        print(f"  - Invalid average volume for symbol '{symbol}'. Skipping low volume day detection.")
+        return
+
+    threshold = avg_volume * 0.20  # 20% of average volume
+    print(f"  - Low volume threshold for '{symbol}': {threshold:.2f} (20% of average {avg_volume:.2f})")
+
+    current_date = start_date
+    low_volume_days = []
+
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+
+        try:
+            # Get the total volume for this day where front_contract = true
+            cursor.execute("""
+                SELECT sum(volume) as daily_volume
+                FROM trades
+                WHERE symbol = %s AND to_str(time, 'yyyy-MM-dd') = %s AND front_contract = true;
+            """, (symbol, date_str))
+
+            result = cursor.fetchone()
+            daily_volume = result[0] if result and result[0] else 0
+
+            if daily_volume < threshold and daily_volume > 0:
+                print(f"  - Low volume day detected: {date_str} (volume: {daily_volume:.2f} < threshold: {threshold:.2f})")
+                low_volume_days.append(date_str)
+
+                # Set front_contract = false for all records on this day for this symbol
+                cursor.execute("""
+                    UPDATE trades
+                    SET front_contract = FALSE
+                    WHERE symbol = %s AND to_str(time, 'yyyy-MM-dd') = %s;
+                """, (symbol, date_str))
+            elif daily_volume > 0:
+                print(f"  - Normal volume day: {date_str} (volume: {daily_volume:.2f})")
+
+        except psycopg2.Error as e:
+            print(f"  - Error processing low volume detection for symbol '{symbol}' on {date_str}: {e}", file=sys.stderr)
+
+        current_date += timedelta(days=1)
+
+    if low_volume_days:
+        print(f"  - Removed {len(low_volume_days)} low volume days for symbol '{symbol}': {', '.join(low_volume_days)}")
+    else:
+        print(f"  - No low volume days detected for symbol '{symbol}'")
+
+
 def main():
     """Main function to run the deduplication process."""
     parser = argparse.ArgumentParser(
         description="Deduplicate trading data in QuestDB by marking front contracts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s
-  %(prog)s --date 2024-01-15
-  %(prog)s --symbol AAPL
-  %(prog)s --date 2024-01-15 --symbol AAPL
+            Examples:
+            %(prog)s
+            %(prog)s --date 2024-01-15
+            %(prog)s --symbol AAPL
+            %(prog)s --date 2024-01-15 --symbol AAPL
         """
     )
     parser.add_argument(
@@ -223,6 +323,7 @@ Examples:
 
             end_date = datetime.now()
             current_date = start_date
+            actual_start_date = start_date
 
             print(f"\nStarting deduplication from {current_date.strftime('%Y-%m-%d')} for symbols: {symbols_to_process}")
 
@@ -242,8 +343,24 @@ Examples:
                 # After the first day, all symbols should be processed
                 symbols_to_process = all_symbols
 
+            # After main processing, perform low volume day removal
+            print("\nStarting low volume day detection and removal...")
 
-            print("\nDeduplication process completed.")
+            for symbol in all_symbols:
+                print(f"\nProcessing low volume detection for symbol: '{symbol}'")
+
+                # Compute average daily volume for the symbol
+                avg_volume = compute_average_daily_volume(symbol, cursor)
+
+                if avg_volume > 0:
+                    # Drop low volume days for the symbol
+                    drop_lowvolume_days(symbol, actual_start_date, end_date, avg_volume, cursor)
+
+                # Commit changes for this symbol
+                conn.commit()
+                print(f"Committed low volume changes for symbol '{symbol}'")
+
+            print("\nDeduplication and low volume day removal process completed.")
 
     finally:
         if conn:

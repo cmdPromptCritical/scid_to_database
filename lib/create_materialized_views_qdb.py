@@ -54,6 +54,7 @@ WITH BASE 'trades' REFRESH IMMEDIATE AS (
         sum(ask_volume) AS ask_volume,
         front_contract
     FROM trades
+    WHERE front_contract = true
     SAMPLE BY 15s
 ) PARTITION BY DAY;
 """
