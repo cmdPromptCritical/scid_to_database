@@ -141,19 +141,26 @@ def create_candlestick_chart(df, symbol, date):
 
     try:
         # Prepare data for mplfinance - set time as index
-        chart_data = df.set_index('time')[['open', 'high', 'low', 'close']]
+        # Check if volume column exists and include it if available
+        base_columns = ['open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            columns = base_columns + ['volume']
+        else:
+            columns = base_columns
+
+        chart_data = df.set_index('time')[columns]
         chart_data.index.name = 'Date'
 
         # Create style for the chart
         mc = mpf.make_marketcolors(up='green', down='red', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc)
 
-        # Create the candlestick chart
+        # Create the candlestick chart with volume bars
         fig, ax = mpf.plot(
             chart_data,
             type='candle',
             style=s,
-            volume=False,
+            volume=True,  # Enable volume bars
             title=f'{symbol} Candlestick Chart - {date}',
             returnfig=True,
             figsize=(12, 8)
@@ -184,7 +191,7 @@ def save_chart(symbol, date):
 
         # Save the figure if it exists
         if current_figure is not None:
-            current_figure.savefig(filepath, dpi=100, bbox_inches='tight')
+            current_figure.savefig(filepath, dpi=400, bbox_inches='tight')
             plt.close(current_figure)  # Close the figure to free memory
             current_figure = None  # Reset for next chart
             print(f"Chart saved: {filepath}")

@@ -4,3 +4,6 @@ questdb.env
 candlestick_charts/
 *.json
 lib/charts/*
+checkpoint_qdb.json
+.gitignore
+lib/generate_candlestick_charts.py
