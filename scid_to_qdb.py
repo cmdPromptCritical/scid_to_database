@@ -69,7 +69,7 @@ def create_table_if_not_exists(table_name, questdb_host, questdb_pg_port, user, 
         print(f"Error connecting to QuestDB or creating table: {e}")
         sys.exit(1)
 
-def get_scid_np(scidFile, offset=0):
+def get_scid_np(scidFile, offset=0, max_records=None):
     f = Path(scidFile)
     assert f.exists(), "SCID file not found"
     with open(scidFile, 'rb') as file:
@@ -90,72 +90,81 @@ def get_scid_np(scidFile, offset=0):
 
         # Adjust the offset if not within the file size
         if offset >= file_size:
-            offset = file_size - (file_size % record_size)
+            return np.array([]), offset # Return empty array if offset is beyond file size
         elif offset < 56:
             offset = 56  # Skip header assumed to be 56 bytes
 
         file.seek(offset)
-        scid_as_np_array = np.fromfile(file, dtype=sciddtype)
+        
+        # Read either max_records or until the end of the file
+        scid_as_np_array = np.fromfile(file, dtype=sciddtype, count=max_records if max_records is not None else -1)
         new_position = file.tell()  # Update the position after reading
 
     return scid_as_np_array, new_position
 
-def send_batch(conf_str, table_name, batches, timestamp_name, df_pandas):
-    """Process batches of data and send to QuestDB"""
+
+def send_batch(conf_str, table_name, batches, timestamp_name, df_processed_polars, worker_id):
+    """
+    Worker function to process batches of data from a shared queue and send them to QuestDB.
+    This function is designed to be memory-efficient by converting only small batches to Pandas DataFrames.
+    """
     try:
         with Sender.from_conf(conf_str, auto_flush=False, init_buf_size=100_000_000) as qdb_sender:
             batch_count = 0
-            failed = False
             while True:
                 try:
                     start_idx, end_idx = batches.pop()
                     batch_count += 1
-                    print(f"Processing batch {batch_count} with {end_idx - start_idx} rows")
+                    print(f"Worker {worker_id}: Processing batch {batch_count} (rows {start_idx}-{end_idx})")
 
-                    # Only create the batch DataFrame when needed
-                    batch_df = df_pandas.iloc[start_idx:end_idx].copy()
+                    # Slice the Polars DataFrame (zero-copy)
+                    batch_df_polars = df_processed_polars[start_idx:end_idx]
+
+                    # Convert only the small slice to Pandas
+                    batch_df_pandas = batch_df_polars.to_pandas()
+
+                    # Ensure timestamp column is correctly formatted
+                    batch_df_pandas['time'] = pd.to_datetime(batch_df_pandas['time'], utc=True, unit='us')
 
                     # Send the batch to QuestDB
                     qdb_sender.dataframe(
-                        batch_df,
+                        batch_df_pandas,
                         table_name=table_name,
-                        symbols=['symbol', 'symbol_period'],  # Mark these columns as SYMBOL types
+                        symbols=['symbol', 'symbol_period'],
                         at=timestamp_name
                     )
                     qdb_sender.flush()
-                    print(f"Successfully sent batch {batch_count}")
+                    print(f"Worker {worker_id}: Successfully sent batch {batch_count}")
 
                     # Explicitly delete the batch to free memory
-                    del batch_df
+                    del batch_df_polars
+                    del batch_df_pandas
 
                 except IndexError:
-                    # No more batches to process
+                    # No more batches to process in the queue
                     break
                 except Exception as e:
-                    print(f"Error processing batch {batch_count}: {e}")
-                    failed = True
-                    # Re-add the batch to the queue for retry (optional)
-                    # batches.append((start_idx, end_idx))
-                    break
+                    print(f"Worker {worker_id}: Error processing batch {batch_count}: {e}")
+                    # Re-raise the exception to be caught by the main thread
+                    raise
 
-            print(f"Thread completed. Processed {batch_count} batches.")
-            if failed:
-                raise Exception("One or more batches failed to process")
+            print(f"Worker {worker_id} completed. Processed {batch_count} batches.")
 
     except IngressError as e:
-        print(f"QuestDB ingestion error: {e}")
-        raise  # Re-raise to propagate the error
+        print(f"Worker {worker_id}: QuestDB ingestion error: {e}")
+        raise
     except Exception as e:
-        print(f"Unexpected error in send_batch: {e}")
-        raise  # Re-raise to propagate the error
+        # Catch errors from both inside the loop and from the Sender context manager
+        print(f"Worker {worker_id}: An unexpected error occurred: {e}")
+        raise
 
 def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='localhost', questdb_port=9009):
-    """Load data into QuestDB using parallel batch processing"""
+    """Load data into QuestDB using parallel batch processing in a memory-efficient way."""
     
     # SCDateTime epoch is December 30, 1899
     epoch = pl.datetime(1899, 12, 30, 0, 0, 0, 0, time_unit="us")
 
-    # Process the dataframe to match QuestDB schema
+    # Process the dataframe to match QuestDB schema. This remains a Polars DataFrame.
     df_processed = df.with_columns([
         (epoch + pl.duration(microseconds=pl.col('scdatetime'))).alias('time'),
         pl.col('open').cast(pl.Float64), 
@@ -168,43 +177,33 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
         pl.col('askvolume').alias('ask_volume').cast(pl.Int32),
         pl.lit(symbol).alias('symbol'),
         pl.lit(symbol_period).alias('symbol_period'),
-        pl.lit(False).alias('front_contract')  # Add front_contract column, all False
+        pl.lit(False).alias('front_contract')
     ]).select([
         'time', 'open', 'high', 'low', 'close',
         'volume', 'number_of_trades', 'bid_volume', 'ask_volume', 'symbol', 'symbol_period', 'front_contract'
     ])
 
-    # convert time column to int64 for QuestDB
+    # Convert time column to int64 for QuestDB. Still a Polars operation.
     df_processed = df_processed.with_columns(
         pl.col('time').cast(pl.Int64).alias('time')
     )
-
-    # Convert to Pandas for QuestDB ingestion
-    df_pandas = df_processed.to_pandas()
-
-    # Ensure the timestamp column is properly formatted for QuestDB
-    df_pandas['time'] = pd.to_datetime(df_pandas['time'], utc=True, unit='us')
-    print(df_pandas.head())
-    #time.sleep(100000)  # Allow time for the print to flush before proceeding
     
-    print(f"Preparing to load {len(df_pandas)} records to QuestDB")
+    print(f"Preparing to load {len(df_processed)} records to QuestDB")
 
-    # Create batches using indices instead of copying data
+    # Create batches of indices. This is lightweight.
     batches = deque()
-    batch_size = int(os.getenv("BATCH_SIZE", "200000"))  # Default 100k records per batch. Set to 1M for high performance
-    parallel_workers = int(os.getenv("PARALLEL_WORKERS", "8"))  # Default 8 parallel connections
+    batch_size = int(os.getenv("BATCH_SIZE", "200000"))
+    parallel_workers = int(os.getenv("PARALLEL_WORKERS", "8"))
 
-    # Calculate batch indices instead of splitting the DataFrame
-    total_rows = len(df_pandas)
+    total_rows = len(df_processed)
     total_batches = total_rows // batch_size + (1 if total_rows % batch_size > 0 else 0)
     print(f"Splitting data into {total_batches} batches of up to {batch_size} records each")
 
     for i in range(total_batches):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, total_rows)
-        if start_idx < end_idx:  # Only add non-empty batches
+        if start_idx < end_idx:
             batches.append((start_idx, end_idx))
-            print(f"Created batch {i+1} with {end_idx - start_idx} records")
 
     # QuestDB connection configuration
     conf_str = f'http::addr={questdb_host}:{questdb_port};'
@@ -215,25 +214,27 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
 
     # Use ThreadPoolExecutor for parallel batch processing
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        futures = []
-        for i in range(parallel_workers):
-            future = executor.submit(send_batch, conf_str, table_name, batches, timestamp_name, df_pandas)
-            futures.append(future)
-            print(f"Started worker {i+1}")
+        # Pass the Polars DataFrame to the workers. This is a reference, not a copy.
+        futures = [
+            executor.submit(send_batch, conf_str, table_name, batches, timestamp_name, df_processed, i + 1)
+            for i in range(parallel_workers)
+        ]
         
-        # Wait for all workers to complete
+        # Wait for all workers to complete and check for failures
         worker_failed = False
         for i, future in enumerate(futures):
             try:
-                future.result()
-                print(f"Worker {i+1} completed successfully")
+                future.result()  # This will re-raise any exception from the worker
+                print(f"Worker {i+1} finished its tasks successfully.")
             except Exception as e:
-                print(f"Worker {i+1} failed with error: {e}")
+                print(f"Worker {i+1} failed with a critical error: {e}")
                 worker_failed = True
 
-        # If any worker failed, raise an exception to stop the process
         if worker_failed:
-            raise WorkerFailureException("One or more workers failed during batch processing")
+            # Cancel any remaining futures to stop processing immediately
+            for f in futures:
+                f.cancel()
+            raise WorkerFailureException("One or more workers failed. Halting processing for this chunk.")
 
     end_time = time.time()
     print(f"Batch processing completed in {end_time - start_time:.2f} seconds")
@@ -241,113 +242,239 @@ def load_data_to_questdb(df, table_name, symbol, symbol_period, questdb_host='lo
     if not batches:
         print("All batches processed successfully")
     else:
-        print(f"Warning: {len(batches)} batches remaining unprocessed")
+        print(f"Warning: {len(batches)} batches remaining unprocessed due to an early exit.")
 
 def main(table_name, scid_file):
+
     """Main processing function"""
+
     start_time = time.time()
+
     
+
     # Get QuestDB connection details from environment variables for table creation
+
     questdb_host = os.getenv("DB_HOST", "localhost")
-    questdb_pg_port = int(os.getenv("QUESTDB_PG_PORT", "8812"))  # Standard PG port for QuestDB, needed for create if not exist function
+
+    questdb_pg_port = int(os.getenv("QUESTDB_PG_PORT", "8812"))
+
     questdb_user = os.getenv("DB_USER", "admin")
+
     questdb_password = os.getenv("DB_PASSWORD", "quest")
 
+    questdb_port = int(os.getenv("DB_PORT", "9000"))
+
+    
+
+    # Define how many records to process in one memory-resident chunk
+
+    processing_chunk_size = int(os.getenv("PROCESSING_CHUNK_SIZE", "2000000"))
+
+
+
     # Create table if it doesn't exist
+
     create_table_if_not_exists(table_name, questdb_host, questdb_pg_port, questdb_user, questdb_password)
 
-    # Extract symbol and symbol_period from the file name
-    file_name = Path(scid_file).stem  # Get file name without extension
 
-    # Use regex to match the symbol and period. Might need adjustment based on your SCID file naming conventions.
-    # Example: ESU5.CME.scid -> symbol: ESU5, symbol_period: CME
-    pattern = r'^([A-Z]{2,3})([A-Z]\d)\.([A-Z]+)$'
-    match = re.match(pattern, file_name)
-    # pattern will return groups ('ES', 'U5', 'CME') for ESU5.CME.scid
+
+    # --- Symbol and Period Parsing ---
+    file_name = Path(scid_file).stem
+    # Updated pattern for filenames like 'ESH4' or 'NQZ23'
+    pattern = r'^([A-Z]{2,4})([HMUZ]\d{1,2})$'
+    match = re.match(pattern, file_name, re.IGNORECASE)
+    
     if match:
-        symbol = match.group(1)  # Combine symbol parts (ES + U5)
-        symbol_period = match.group(2)
+        symbol = match.group(1).upper()
+        period_code = match.group(2).upper()
+        # The symbol_period should be distinct for plotting, e.g., 'ES_H4'
+        # This format is expected by the visualization script
+        symbol_period = f"{symbol}_{period_code}"
     else:
-        # Fallback to splitting by '.' if regex doesn't match   
-        print(f"Warning: Unable to parse symbol and period from file name '{file_name}'. Using fallback method.")    
-        parts = file_name.split('.')
-        symbol = parts[0] if len(parts) > 0 else ""
-        symbol_period = parts[1] if len(parts) > 1 else ""
+        print(f"Warning: Unable to parse symbol and period from file name '{file_name}'. Using file name as fallback.")
+        symbol = file_name
+        symbol_period = file_name
+
+
+
+    # --- Checkpoint Loading ---
 
     checkpoint_file = Path(f"checkpoint_qdb.json")
 
-    # Check if the initial load is done, otherwise set last_position to 0 and initial_load_done to False
+    checkpoint_key = f'{symbol}{symbol_period}'
+
     last_position = 0
-    initial_load_done = False
+
     checkpoint_data = {}
 
+
+
     if checkpoint_file.exists():
+
         try:
+
             with open(checkpoint_file, "r") as f:
+
                 checkpoint_data = json.load(f)
-                # Ensure the correct table_name is used for checkpoint data retrieval
-                table_data = checkpoint_data.get(f'{symbol}{symbol_period}', {})
+
+                table_data = checkpoint_data.get(checkpoint_key, {})
+
                 last_position = table_data.get("last_position", 0)
-                initial_load_done = table_data.get("initial_load_done", False)
-                print(f"Last position for {symbol}{symbol_period}: {last_position}, Initial load done: {initial_load_done}")
-        except json.JSONDecodeError:
+
+                print(f"Resuming from position {last_position} for {checkpoint_key}.")
+
+        except (json.JSONDecodeError, IOError) as e:
+
+            print(f"Checkpoint file '{checkpoint_file}' is corrupted or unreadable: {e}. Starting fresh.")
+
             checkpoint_data = {}
-            print("Checkpoint file is corrupted or empty. Starting fresh.")
+
+    
 
     print(f"Processing SCID file: {scid_file}, Symbol: {symbol}, Period: {symbol_period}")
 
-    intermediate_np_array, new_position = get_scid_np(scid_file, offset=last_position)
 
-    if new_position > last_position:  # Only update if there's new data
-        print(f"Found {len(intermediate_np_array)} new records")
-        df_raw = pl.DataFrame(intermediate_np_array)
-        
-        # Get QuestDB connection details from environment variables
-        questdb_host = os.getenv("DB_HOST", "localhost")
-        questdb_port = int(os.getenv("DB_PORT", "9000"))
-        
-        load_data_to_questdb(df_raw, table_name, symbol, symbol_period, questdb_host, questdb_port)
-        
-        last_position = new_position  # Updates the last position
 
-        # Update the checkpoint file with the new position and initial load status
-        checkpoint_data[f'{symbol}{symbol_period}'] = {
-            "last_position": last_position, 
-            "initial_load_done": True
-        }
-        
-        with open(checkpoint_file, "w") as f:
-            json.dump(checkpoint_data, f, indent=4)
+    # --- Chunked File Processing Loop ---
+
+    all_chunks_processed = False
+
+    while True:
+
+        try:
+
+            intermediate_np_array, new_position = get_scid_np(scid_file, offset=last_position, max_records=processing_chunk_size)
+
+
+
+            if intermediate_np_array.size == 0:
+
+                print(f"No new data found for {checkpoint_key} at position {last_position}.")
+
+                all_chunks_processed = True
+
+                break  # Exit loop when no more records are read
+
+
+
+            print(f"Read {len(intermediate_np_array)} new records from position {last_position}.")
+
+            df_raw = pl.DataFrame(intermediate_np_array)
+
+            del intermediate_np_array # Free memory
+
             
-        print(f"Checkpoint updated: position {last_position}")
-    else:
-        print(f"No new data to process for {table_name} at position {last_position}. Skipping update.")
+
+            load_data_to_questdb(df_raw, table_name, symbol, symbol_period, questdb_host, questdb_port)
+
+            
+
+            # --- Checkpoint Saving ---
+
+            last_position = new_position
+
+            checkpoint_data[checkpoint_key] = {
+
+                "last_position": last_position,
+
+                "initial_load_done": False # Mark as not done until the very end
+
+            }
+
+            with open(checkpoint_file, "w") as f:
+
+                json.dump(checkpoint_data, f, indent=4)
+
+            print(f"Checkpoint updated to position {last_position} for {checkpoint_key}.")
+
+        
+
+        except WorkerFailureException as e:
+
+            print(f"BATCH FAILED: {e}. Current progress for this chunk is lost. Checkpoint is at {last_position}.")
+
+            print("The script will retry from the last successful checkpoint in the next cycle.")
+
+            raise # Re-raise to be caught by the main execution loop
+
+
+
+        except Exception as e:
+
+            print(f"An unexpected error occurred during chunk processing: {e}")
+
+            raise # Re-raise to be caught by the main execution loop
+
+
+
+
+
+    # --- Finalize Checkpoint ---
+
+    if all_chunks_processed:
+
+        table_data = checkpoint_data.get(checkpoint_key, {})
+
+        table_data['initial_load_done'] = True
+
+        table_data['last_position'] = last_position # Ensure last position is current
+
+        checkpoint_data[checkpoint_key] = table_data
+
+        
+
+        with open(checkpoint_file, "w") as f:
+
+            json.dump(checkpoint_data, f, indent=4)
+
+        print(f"Finished processing all data for {checkpoint_key}. Final checkpoint saved.")
+
+
 
     end_time = time.time()
-    print(f"Total execution time: {end_time - start_time:.2f} seconds")
+
+    print(f"Total execution time for this run: {end_time - start_time:.2f} seconds")
+
+
 
 if __name__ == "__main__":
-    # Import pandas here since it's needed for QuestDB ingestion
+    # Import pandas here as it's a dependency for the main logic
     import pandas as pd
-    
-    table_name = "trades"  # QuestDB table name
-    scid_file = r"C:\auxDrive\SierraChart2\Data\ESM5.CME.scid"  # Set the file path to your SCID file.
 
-    # Continuously update data from SCID file every 'x' seconds
+    table_name = os.getenv("DB_TABLE", "trades")  # QuestDB table name
+    scid_folder_path = os.getenv("SCID_FOLDER", r"C:\auxDrive\SierraChart2\Data") # Default data folder
+
+    # Continuously update data from SCID files found in the folder
     while True:
         try:
-            main(table_name, scid_file)
-            sleep_duration = int(os.getenv("SLEEP_DURATION", "1000"))  # Default 1000 seconds
-            print(f"Sleeping for {sleep_duration} seconds...")
+            scid_folder = Path(scid_folder_path)
+            if not scid_folder.is_dir():
+                print(f"Error: The path specified in SCID_FOLDER is not a valid directory: '{scid_folder_path}'")
+                break  # Exit if the directory is invalid
+
+            files_to_process = list(scid_folder.glob('*.scid'))
+            print(f"Found {len(files_to_process)} .scid files to process in '{scid_folder_path}'.")
+
+            # Loop through each file and process it
+            for scid_file in files_to_process:
+                print(f"\n--- Starting processing for {scid_file.name} ---")
+                try:
+                    # The main function handles the entire logic for one file
+                    main(table_name, str(scid_file))
+                except WorkerFailureException as e:
+                    print(f"A worker failed while processing {scid_file.name}: {e}. Continuing to the next file.")
+                except Exception as e:
+                    print(f"An unexpected error occurred processing {scid_file.name}: {e}. Continuing to the next file.")
+
+            sleep_duration = int(os.getenv("SLEEP_DURATION", "3600"))  # Default to 1 hour
+            print(f"\n--- Cycle complete. Sleeping for {sleep_duration} seconds... ---")
             time.sleep(sleep_duration)
+
         except KeyboardInterrupt:
-            print("Process interrupted by user")
-            break
-        except WorkerFailureException as e:
-            print(f"Worker failure detected: {e}")
-            print("Exiting due to worker failure...")
+            print("Process interrupted by user. Exiting.")
             break
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            # This catches broader errors like the directory not existing at startup
+            print(f"An unexpected error occurred in the main loop: {e}")
             print("Retrying in 60 seconds...")
             time.sleep(60)
