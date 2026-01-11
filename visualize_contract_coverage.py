@@ -1,3 +1,19 @@
+"""
+Script purpose:
+- Connects to a QuestDB/Postgres-compatible endpoint using credentials from qdb.env.
+- Runs a daily sampling query to compute trade counts (volume) per day, including both
+  the base symbol and the contract period (symbol_period).
+- Loads the query result into a pandas DataFrame, extracts the base symbol (prefix before '_'
+  or uses the provided 'symbol' column), pivots by time so each symbol_period becomes a column,
+  and produces a single stacked-area plot per base symbol showing daily volume split by contract.
+Output:
+- One stacked-area PNG file per base symbol (e.g., ES_volume_distribution.png).
+- Each stacked area uses a different color for each symbol_period column.
+Notes:
+- The database table must contain the columns: time, symbol, symbol_period.
+- The SQL uses QuestDB's SAMPLE BY 1d to aggregate per-day counts; the query must return
+  per-day rows that include symbol and symbol_period for correct pivoting.
+"""
 import os
 import pandas as pd
 import psycopg2
@@ -30,10 +46,10 @@ def fetch_daily_volume(conn):
     load_dotenv('qdb.env')
     table_name = os.getenv("DB_TABLE", "market_data")
     
-    # This query efficiently samples the data by 1-day intervals,
-    # counting trades for each symbol_period within those intervals.
+    # This query samples the data by 1-day intervals and returns the symbol and symbol_period
+    # along with the count of trades (volume) for each sampled row.
     query = f"""
-    SELECT time, symbol_period, count() as volume
+    SELECT time, symbol, symbol_period, count() AS volume
     FROM {table_name}
     SAMPLE BY 1d;
     """
@@ -63,8 +79,15 @@ def plot_volume_distribution(df):
         print("DataFrame is empty. Cannot generate plots.")
         return
 
-    # Extract base symbol (e.g., 'ES' from 'ES_2025-03')
-    df['symbol'] = df['symbol_period'].str.split('_').str[0]
+    # If the query already returns a 'symbol' column, use it; otherwise extract from symbol_period
+    if 'symbol' not in df.columns and 'symbol_period' in df.columns:
+        df['symbol'] = df['symbol_period'].str.split('_').str[0]
+    elif 'symbol' in df.columns:
+        # Ensure symbol is string type
+        df['symbol'] = df['symbol'].astype(str)
+    else:
+        print("Required columns 'symbol' or 'symbol_period' not found in DataFrame.")
+        return
 
     symbols = df['symbol'].unique()
     
@@ -76,12 +99,16 @@ def plot_volume_distribution(df):
         # Pivot data to have time as index, symbol_periods as columns, and volume as values
         pivot_df = symbol_df.pivot(index='time', columns='symbol_period', values='volume').fillna(0)
         
+        if pivot_df.empty:
+            print(f"No pivotable data for symbol {symbol}. Skipping.")
+            continue
+
         # Ensure columns are sorted chronologically (e.g., ES_2025-03, ES_2025-06)
         pivot_df = pivot_df.reindex(sorted(pivot_df.columns), axis=1)
 
         fig, ax = plt.subplots(figsize=(15, 7))
         
-        # Generate the stacked area plot
+        # Generate the stacked area plot; each column (symbol_period) becomes a colored area
         pivot_df.plot(
             kind='area',
             stacked=True,
